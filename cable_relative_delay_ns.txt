@@ -1,0 +1,22 @@
+# One signal per line: <signal_name> <relative_cable_delay_ns>
+# The first two reference signals must be 0 ns.
+1 ant1_X 0.00
+2 ant1_Y 0.00
+3 ant2_X 0.00
+4 ant2_Y 1.20
+5 ant3_X 3.00
+6 ant3_Y 3.00
+7 ant4_X 4.00
+8 ant4_Y 4.00
+9 ant5_X 2.20
+10 ant5_Y 2.20
+11 ant6_X 1.50
+12 ant6_Y 1.50
+13 ant7_X 1.60
+# 14 ant7_Y 1.60
+15 ant8_X -0.80
+16 ant8_Y -0.80
+17 ant9_X 0.45
+# 18 ant9_Y 0.45
+# 19 ant10_X -3.00
+20 ant10_Y -3.00

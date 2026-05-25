@@ -1,0 +1,22 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Runtime logs
+*.log
+
+# Generated trace / coefficient outputs
+beam_coeff.txt
+beam_coeff.npz
+beam_coeff.bin
+time_phase_coeff.dat
+time_phase_coeff.npz
+trace_mode_phase_coeff.txt
+
+# Generated reports / previews
+beam32_report.txt
+trace_32beam_beam_offsets.txt
+trace_32beam_beam_directions.txt
+beam32_layout_from_offsets.png
+beam32_direction_vectors.npz
