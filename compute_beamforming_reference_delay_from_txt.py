@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import division, print_function
 
+import argparse
+import hashlib
 import io
 import os
 import time
@@ -26,15 +28,16 @@ FREQ_STOP_HZ = 1.5e9
 TOTAL_SIGNAL_INPUTS = 20
 TIME_DELAY_STEP_NS = 0.9765625
 MAX_TIME_DELAY_STEPS = 4096
-TRACE_VALUE = 1
+TRACE_VALUE = 0
 REQUIRE_REFERENCE_INPUTS = True
 REFERENCE_INPUT_IDS = (1, 2)
 MISSING_SIGNAL_NAME_PREFIX = "MISSING_INPUT_"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CABLE_DELAY_TXT = os.path.join(SCRIPT_DIR, "cable_relative_delay_ns.txt")
-DAT_FILE = os.path.join(SCRIPT_DIR, "time_phase_coeff.dat")
-NPZ_FILE = os.path.join(SCRIPT_DIR, "time_phase_coeff.npz")
+INPUT_CABLE_DELAY_TXT = None
+OUTPUT_DIR = SCRIPT_DIR
+NPZ_FILE = os.path.join(OUTPUT_DIR, "time_phase_coeff.npz")
+NPZ_MD5_FILE = os.path.splitext(NPZ_FILE)[0] + ".md5"
 
 # Example cable_relative_delay_ns.txt:
 # input_id signal_name delay_ns
@@ -45,6 +48,67 @@ NPZ_FILE = os.path.join(SCRIPT_DIR, "time_phase_coeff.npz")
 # 20 天线10_2 2.20
 #
 # Inputs 3,4,7,8,... not listed above are treated as missing and zero-filled.
+
+
+def build_arg_parser():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Read one cable-delay TXT file and write "
+            "time_phase_coeff.npz plus the NPZ md5 sidecar."
+        )
+    )
+    parser.add_argument(
+        "-f",
+        "--input-file",
+        required=True,
+        help=(
+            "Path to the input cable-delay TXT file. "
+            "Example: cable_relative_delay_ns.txt"
+        ),
+    )
+    parser.add_argument(
+        "-o",
+        "--output-dir",
+        dest="output_dir",
+        default=OUTPUT_DIR,
+        help=(
+            "Directory for generated time_phase_coeff.npz/.md5 files. "
+            "Default: script directory."
+        ),
+    )
+    return parser
+
+
+def configure_input_file(input_file):
+    global INPUT_CABLE_DELAY_TXT
+
+    if not input_file:
+        raise ValueError("input_file must not be empty")
+
+    input_file = os.path.abspath(os.path.expanduser(input_file))
+    INPUT_CABLE_DELAY_TXT = input_file
+    return INPUT_CABLE_DELAY_TXT
+
+
+def configure_output_dir(output_dir):
+    global OUTPUT_DIR
+    global NPZ_FILE
+    global NPZ_MD5_FILE
+
+    if output_dir is None:
+        raise ValueError("output_dir must not be None")
+
+    output_dir = os.path.abspath(os.path.expanduser(output_dir))
+    if os.path.exists(output_dir) and not os.path.isdir(output_dir):
+        raise ValueError("Output path exists but is not a directory: {}".format(output_dir))
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    OUTPUT_DIR = output_dir
+    NPZ_FILE = os.path.join(OUTPUT_DIR, "time_phase_coeff.npz")
+    NPZ_MD5_FILE = os.path.splitext(NPZ_FILE)[0] + ".md5"
+
+    return OUTPUT_DIR
 
 
 def atomic_replace(src_path, dst_path):
@@ -69,6 +133,33 @@ def quantize_q14(values):
 
 def build_frequency_axis_hz():
     return np.linspace(FREQ_START_HZ, FREQ_STOP_HZ, N_FREQ_CHANNELS, dtype=np.float64)
+
+
+def compute_file_md5(path, chunk_size=1024 * 1024):
+    """Return the hex MD5 digest for one file."""
+
+    digest = hashlib.md5()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def write_md5_file_for_output(path, md5_path):
+    """Write one UTF-8 MD5 checksum file for the requested output file."""
+
+    checksum = compute_file_md5(path)
+    tmp_path = md5_path + ".tmp"
+    line = "{}  {}\n".format(checksum, os.path.basename(path))
+    with io.open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(line)
+        f.flush()
+        os.fsync(f.fileno())
+    atomic_replace(tmp_path, md5_path)
+    return checksum
 
 
 def load_signal_relative_delays_ns(txt_path, total_inputs):
@@ -269,7 +360,7 @@ def atomic_write_dat(out_path, time_delay_u16_array, coeff_real_q14, coeff_imag_
     if trace_value < 0 or trace_value > 0xFFFF:
         raise ValueError("TRACE_VALUE must fit in uint16")
 
-    time_delay_le = np.asarray(time_delay_u16_array, dtype="<u2")
+    time_delay_le = np.asarray(time_delay_u16_array, dtype="<u2")#u64bit <u8
     fine_interleaved = np.empty((coeff_real_q14.shape[0], coeff_real_q14.shape[1], 2), dtype="<i2")
     fine_interleaved[:, :, 0] = coeff_real_q14.astype("<i2")
     fine_interleaved[:, :, 1] = coeff_imag_q14.astype("<i2")
@@ -282,24 +373,101 @@ def atomic_write_dat(out_path, time_delay_u16_array, coeff_real_q14, coeff_imag_
     atomic_replace(tmp_path, out_path)
 
 
+def atomic_write_time_phase_coeff_txt(
+    out_path,
+    time_delay_u16_array,
+    coeff_real_q14,
+    coeff_imag_q14,
+    trace_value,
+):
+    """Write human-readable time_phase_coeff.txt.
+
+    TXT layout:
+      line 1    : time_delay[20], uint16 integers, space separated
+      line 2-21 : coeff[20,2048], token format real_q14,imag_q14
+      line 22   : trace, integer 0 or 1
+
+    Note:
+      coeff real/imag are raw int16 Q14 integers.
+      Do not divide by 2^14.
+    """
+
+    validate_solution_shapes(time_delay_u16_array, coeff_real_q14, coeff_imag_q14)
+
+    time_delay_u16 = np.asarray(time_delay_u16_array, dtype=np.uint16)
+    real_i16 = np.asarray(coeff_real_q14, dtype=np.int16)
+    imag_i16 = np.asarray(coeff_imag_q14, dtype=np.int16)
+
+    trace_i64 = int(trace_value)
+    if trace_i64 not in (0, 1):
+        raise ValueError("trace must be 0 or 1, got {}".format(trace_i64))
+
+    tmp_path = out_path + ".tmp"
+
+    with io.open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(" ".join(str(int(x)) for x in time_delay_u16))
+        f.write("\n")
+
+        for input_index in range(TOTAL_SIGNAL_INPUTS):
+            row_tokens = []
+            for freq_index in range(N_FREQ_CHANNELS):
+                real_value = int(real_i16[input_index, freq_index])
+                imag_value = int(imag_i16[input_index, freq_index])
+                row_tokens.append("{},{}".format(real_value, imag_value))
+            f.write(" ".join(row_tokens))
+            f.write("\n")
+
+        f.write(str(trace_i64))
+        f.write("\n")
+
+        f.flush()
+        os.fsync(f.fileno())
+
+    atomic_replace(tmp_path, out_path)
+
+
 def atomic_write_npz(out_path, time_delay_u16_array, coeff_real_q14, coeff_imag_q14, trace_value):
+    """Write NPZ parameter file.
+
+    NPZ keys:
+      coeff      : complex128[20,2048]
+                   Q14-scaled complex values.
+                   coeff.real = coeff_real_q14 as float64, not divided by 2^14.
+                   coeff.imag = coeff_imag_q14 as float64, not divided by 2^14.
+
+      time_delay : int64[20]
+
+      trace      : int64 scalar
+
+    Important:
+      Do NOT divide coeff_real_q14 or coeff_imag_q14 by 2^14.
+      Example:
+        mathematical 1.0 + 0.0j is stored as 16384.0 + 0.0j.
+    """
+
     validate_solution_shapes(time_delay_u16_array, coeff_real_q14, coeff_imag_q14)
     tmp_path = out_path + ".tmp"
 
-    coeff_complex = (
-        coeff_real_q14.astype(np.float32) / (1 << 14)
-        + 1j * (coeff_imag_q14.astype(np.float32) / (1 << 14))
-    ).astype(np.complex64)
-    trace_u16 = np.asarray([trace_value], dtype=np.uint16)
+    trace_i64 = int(trace_value)
+    if trace_i64 not in (0, 1):
+        raise ValueError("trace_value must be 0 or 1, got {}".format(trace_i64))
+
+    time_delay_i64 = np.asarray(time_delay_u16_array, dtype=np.int64)
+    coeff_complex128 = (
+        np.asarray(coeff_real_q14, dtype=np.float64)
+        + 1j * np.asarray(coeff_imag_q14, dtype=np.float64)
+    ).astype(np.complex128)
+    trace_i64_array = np.asarray(trace_i64, dtype=np.int64)
 
     with open(tmp_path, "wb") as f:
         np.savez(
             f,
-            time_delay=np.asarray(time_delay_u16_array, dtype=np.uint16),
-            coeff=coeff_complex,
-            trace=trace_u16,
+            coeff=coeff_complex128,
+            time_delay=time_delay_i64,
+            trace=trace_i64_array,
         )
     atomic_replace(tmp_path, out_path)
+    return write_md5_file_for_output(out_path, NPZ_MD5_FILE)
 
 
 def write_current_solution_from_txt(frequencies_hz):
@@ -310,7 +478,7 @@ def write_current_solution_from_txt(frequencies_hz):
         active_input_indices,
         missing_input_indices,
     ) = load_signal_relative_delays_ns(
-        CABLE_DELAY_TXT,
+        INPUT_CABLE_DELAY_TXT,
         TOTAL_SIGNAL_INPUTS,
     )
     compensation_delay_ns, reference_physical_delay_ns = convert_cable_delay_to_compensation_delay_ns(
@@ -333,14 +501,7 @@ def write_current_solution_from_txt(frequencies_hz):
     )
     signal_time_delay_u16_array = np.asarray(time_delay_steps_i32_array, dtype=np.uint16)
 
-    atomic_write_dat(
-        DAT_FILE,
-        signal_time_delay_u16_array,
-        coeff_real_q14,
-        coeff_imag_q14,
-        TRACE_VALUE,
-    )
-    atomic_write_npz(
+    npz_md5 = atomic_write_npz(
         NPZ_FILE,
         signal_time_delay_u16_array,
         coeff_real_q14,
@@ -359,6 +520,7 @@ def write_current_solution_from_txt(frequencies_hz):
         active_mask,
         active_input_indices,
         missing_input_indices,
+        npz_md5,
     )
 
 
@@ -377,6 +539,7 @@ def print_cycle_report(
     active_mask,
     active_input_indices,
     missing_input_indices,
+    npz_md5,
 ):
     print("Cycle {:04d} | UTC {}".format(cycle_index, utc_now.strftime("%Y-%m-%d %H:%M:%S")))
     print("  input cable delay file: {}".format(input_path))
@@ -394,6 +557,9 @@ def print_cycle_report(
         )
     )
     print("  missing input fill: time_delay=0, coeff=0+0j")
+    print("  npz file: {}".format(NPZ_FILE))
+    print("  npz md5 file: {}".format(NPZ_MD5_FILE))
+    print("  npz md5: {}".format(npz_md5))
     print(
         "  physical max cable delay used as alignment reference: {:.6f} ns".format(
             reference_physical_delay_ns
@@ -432,13 +598,14 @@ def run_forever():
         raise ValueError("TXT_READ_INTERVAL_SECONDS must be > 0")
 
     print("Cable-delay-to-phase-coeff publisher")
-    print("Input cable delay TXT: {}".format(CABLE_DELAY_TXT))
+    print("Input cable delay TXT: {}".format(INPUT_CABLE_DELAY_TXT))
+    print("Output directory: {}".format(OUTPUT_DIR))
     print("TXT format: <input_id 1..20> <signal_name> <delay_ns>")
     print("Missing input ids are zero-filled")
     print("Reference input ids: {}".format(", ".join(str(x) for x in REFERENCE_INPUT_IDS)))
     print("Require reference inputs: {}".format(REQUIRE_REFERENCE_INPUTS))
-    print("DAT file: {}".format(DAT_FILE))
     print("NPZ file: {}".format(NPZ_FILE))
+    print("NPZ MD5 file: {}".format(NPZ_MD5_FILE))
     print("Hardware signal inputs: {}".format(TOTAL_SIGNAL_INPUTS))
     print("Loop interval: {:.1f} s".format(LOOP_INTERVAL_SECONDS))
     print("TXT read interval: {:.1f} s".format(TXT_READ_INTERVAL_SECONDS))
@@ -453,18 +620,20 @@ def run_forever():
         )
     )
     print("Trace value: {}".format(TRACE_VALUE))
-    print(
-        "DAT layout: 20x uint16 time_delay, then 20x2048 complex coeff "
-        "(real int16 q14, imag int16 q14 interleaved), then trace uint16, little-endian"
-    )
-    print("NPZ keys: time_delay, coeff, trace")
+    print("")
+    print("NPZ keys: coeff, time_delay, trace")
+    print("NPZ coeff dtype: complex128[20,2048]")
+    print("NPZ coeff value convention: Q14-scaled values, 16384 means 1.0")
+    print("NPZ time_delay dtype: int64[20]")
+    print("NPZ trace dtype: int64 scalar")
+    print("NPZ MD5: checksum of {}".format(os.path.basename(NPZ_FILE)))
     print("")
 
     cycle_index = 0
     if RUN_ONCE:
         utc_now = datetime.utcnow().replace(microsecond=0)
         results = write_current_solution_from_txt(frequencies_hz)
-        print_cycle_report(cycle_index, utc_now, CABLE_DELAY_TXT, True, *results)
+        print_cycle_report(cycle_index, utc_now, INPUT_CABLE_DELAY_TXT, True, *results)
         return
 
     last_results = None
@@ -480,10 +649,18 @@ def run_forever():
         if txt_reloaded_this_cycle:
             last_results = write_current_solution_from_txt(frequencies_hz)
             last_txt_read_monotonic = now_monotonic
-        print_cycle_report(cycle_index, utc_now, CABLE_DELAY_TXT, txt_reloaded_this_cycle, *last_results)
+        print_cycle_report(cycle_index, utc_now, INPUT_CABLE_DELAY_TXT, txt_reloaded_this_cycle, *last_results)
         cycle_index += 1
         time.sleep(LOOP_INTERVAL_SECONDS)
 
 
-if __name__ == "__main__":
+def main(argv=None):
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+    configure_input_file(args.input_file)
+    configure_output_dir(args.output_dir)
     run_forever()
+
+
+if __name__ == "__main__":
+    main()

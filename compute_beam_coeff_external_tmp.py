@@ -10,7 +10,7 @@ Pipeline:
 6. Compute 32 beam directions per antenna
 7. Compute beam phase coefficients
 8. Convert coefficients to Phi2 float stream
-9. Write hardware-order beam_coeff.txt / beam_coeff.bin and diagnostic outputs
+9. Write hardware-order beam_coeff.txt, write its MD5 checksum, and optionally render the layout plot
 
 This script is intentionally self-contained so the full workflow can be inspected
 and modified in one file.
@@ -18,26 +18,28 @@ and modified in one file.
 
 from __future__ import division, print_function
 
+import argparse
+import hashlib
 import io
 import math
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional
-
 import ephem
 import katpoint
 import numpy as np
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-OUT_TXT = os.path.join(SCRIPT_DIR, "beam32_report.txt")
-OUT_NPZ = os.path.join(SCRIPT_DIR, "beam32_direction_vectors.npz")
-OUT_BEAM_COEFF_TXT = os.path.join(SCRIPT_DIR, "beam_coeff.txt")
-OUT_BEAM_COEFF_NPZ = os.path.join(SCRIPT_DIR, "beam_coeff.npz")
-OUT_BEAM_COEFF_BIN = os.path.join(SCRIPT_DIR, "beam_coeff.bin")
-OUT_BEAM_LAYOUT_PNG = os.path.join(SCRIPT_DIR, "beam32_layout_from_offsets.png")
-BEAM_OFFSETS_TXT = os.path.join(SCRIPT_DIR, "config_32beam_hex37_drop5_beam_offsets.txt")
+OUTPUT_DIR = SCRIPT_DIR
+OUT_TXT = os.path.join(OUTPUT_DIR, "beam32_report.txt")
+OUT_NPZ = os.path.join(OUTPUT_DIR, "beam32_direction_vectors.npz")
+OUT_BEAM_COEFF_TXT = os.path.join(OUTPUT_DIR, "beam_coeff.txt")
+OUT_BEAM_COEFF_MD5 = os.path.splitext(OUT_BEAM_COEFF_TXT)[0] + ".md5"
+OUT_BEAM_COEFF_NPZ = os.path.join(OUTPUT_DIR, "beam_coeff.npz")
+OUT_BEAM_COEFF_BIN = os.path.join(OUTPUT_DIR, "beam_coeff.bin")
+OUT_BEAM_LAYOUT_PNG = os.path.join(OUTPUT_DIR, "beam32_layout_from_offsets.png")
+BEAM_OFFSETS_TXT = None
 EXPECTED_BEAM_COUNT = 32
 HARDWARE_COEFF_ORDER = "frequency -> beam -> input"
 HARDWARE_COEFF_INDEX_FORMULA = "index = ((v * 32) + j) * 20 + i"
@@ -46,8 +48,7 @@ CENTER_BEAM_DESCRIPTION = "BeamID 1 / beam_index 0 / zero offset"
 MISSING_INPUT_FILL_VALUE = 0.0
 
 # User-adjustable runtime parameters.
-ANTS_TXT = r"d:\总\博\imaging\uvcovplot-master\ants.txt"
-FIRST_SOLUTION_TIME_UTC = None
+ANTS_TXT = None
 N_FREQ_CHANNELS = 2048
 FREQ_START_HZ = 1.0e9
 FREQ_STOP_HZ = 1.5e9
@@ -67,11 +68,7 @@ PRINT_PIPELINE_STEPS = True
 PRINT_RUNTIME_CONFIG = True
 PRINT_INTERMEDIATE_SAMPLES = True
 
-# User target configuration.
-TARGET_NAME = "TARGET"
-TARGET_RA = "19:35:00.00"
-TARGET_DEC = "21:54:00.00"
-IGNORE_VISIBILITY = True
+DEFAULT_TARGET_NAME = "TARGET"
 
 
 @dataclass(frozen=True)
@@ -89,7 +86,6 @@ class RuntimeConfig:
     """User-adjustable runtime parameters for the beam pipeline."""
 
     ants_txt: str
-    first_solution_time_utc: Optional[str]
     n_freq_channels: int
     freq_start_hz: float
     freq_stop_hz: float
@@ -175,12 +171,183 @@ def build_frequency_axis_hz(runtime_config):
     )
 
 
+def compute_file_md5(path, chunk_size=1024 * 1024):
+    """Compute the MD5 checksum of one local file."""
+
+    digest = hashlib.md5()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def write_md5_file_for_output(path, md5_path):
+    """Write a standard md5 checksum sidecar for one generated output file."""
+
+    md5_hex = compute_file_md5(path)
+    tmp_path = md5_path + ".tmp"
+    with io.open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
+        f.write("{}  {}\n".format(md5_hex, os.path.basename(path)))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, md5_path)
+    return md5_hex
+
+
+def parse_direction_arg(direction_text):
+    """Parse a command-line direction string into RA and Dec fields."""
+
+    parts = str(direction_text).strip().split()
+    if len(parts) != 2:
+        raise ValueError(
+            'Invalid -d/--direction. Expected "RA DEC", for example "19:35:00 21:54:00".'
+        )
+    return parts[0], parts[1]
+
+
+def parse_time_utc_arg(time_text):
+    """Parse a minute-precision UTC datetime and normalize seconds to zero."""
+
+    time_text = str(time_text).strip()
+    try:
+        return datetime.strptime(time_text, "%Y-%m-%d %H:%M").replace(second=0)
+    except ValueError:
+        raise ValueError(
+            'Invalid -t/--time-utc. Expected UTC datetime to minute precision '
+            '"YYYY-MM-DD HH:MM", for example "2026-06-04 20:20". Seconds are '
+            'set to 00 automatically.'
+        )
+
+
+def parse_args():
+    """Parse and validate the command-line arguments."""
+
+    parser = argparse.ArgumentParser(
+        description="Compute 32-beam Phi2 coefficients from user-provided RA/Dec center and UTC time.",
+    )
+    parser.add_argument(
+        "-d",
+        "--direction",
+        required=True,
+        help='Center direction as "RA DEC", for example "19:35:00 21:54:00".',
+    )
+    parser.add_argument(
+        "-t",
+        "--time-utc",
+        required=True,
+        help='UTC datetime as "YYYY-MM-DD HH:MM", for example "2026-06-04 20:20". Seconds default to 00.',
+    )
+    parser.add_argument(
+        "-f",
+        "--ants-file",
+        required=True,
+        dest="ants_file",
+        help="Path to the antenna TXT file, for example ants.txt.",
+    )
+    parser.add_argument(
+        "-b",
+        "--beam-offsets-file",
+        required=True,
+        dest="beam_offsets_file",
+        help=(
+            "Path to the 32-beam offsets TXT file, for example "
+            "config_32beam_hex37_drop5_beam_offsets.txt."
+        ),
+    )
+    parser.add_argument(
+        "--target-name",
+        default=DEFAULT_TARGET_NAME,
+        help="Target name used in reports and npz metadata.",
+    )
+    parser.add_argument(
+        "-o",
+        "--output-dir",
+        dest="output_dir",
+        default=OUTPUT_DIR,
+        help=(
+            "Directory for generated output files such as beam_coeff.txt/.md5 "
+            "and the layout PNG. Default: script directory."
+        ),
+    )
+    args = parser.parse_args()
+
+    try:
+        args.target_ra, args.target_dec = parse_direction_arg(args.direction)
+        args.when_utc = parse_time_utc_arg(args.time_utc)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    return args
+
+
+def configure_ants_file(ants_file):
+    """Update the antenna TXT file path from the command line."""
+
+    global ANTS_TXT
+
+    if not ants_file:
+        raise ValueError("ants_file must not be empty")
+
+    ANTS_TXT = os.path.abspath(os.path.expanduser(ants_file))
+    return ANTS_TXT
+
+
+def configure_beam_offsets_file(beam_offsets_file):
+    """Update the beam-offset TXT file path from the command line."""
+
+    global BEAM_OFFSETS_TXT
+
+    if not beam_offsets_file:
+        raise ValueError("beam_offsets_file must not be empty")
+
+    BEAM_OFFSETS_TXT = os.path.abspath(os.path.expanduser(beam_offsets_file))
+    return BEAM_OFFSETS_TXT
+
+
+def configure_output_dir(output_dir):
+    """Update all output file paths to use the requested directory."""
+
+    global OUTPUT_DIR
+    global OUT_TXT
+    global OUT_NPZ
+    global OUT_BEAM_COEFF_TXT
+    global OUT_BEAM_COEFF_MD5
+    global OUT_BEAM_COEFF_NPZ
+    global OUT_BEAM_COEFF_BIN
+    global OUT_BEAM_LAYOUT_PNG
+
+    if output_dir is None:
+        raise ValueError("output_dir must not be None")
+
+    output_dir = os.path.abspath(os.path.expanduser(output_dir))
+    if os.path.exists(output_dir) and not os.path.isdir(output_dir):
+        raise ValueError("Output path exists but is not a directory: {}".format(output_dir))
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    OUTPUT_DIR = output_dir
+    OUT_TXT = os.path.join(OUTPUT_DIR, "beam32_report.txt")
+    OUT_NPZ = os.path.join(OUTPUT_DIR, "beam32_direction_vectors.npz")
+    OUT_BEAM_COEFF_TXT = os.path.join(OUTPUT_DIR, "beam_coeff.txt")
+    OUT_BEAM_COEFF_MD5 = os.path.splitext(OUT_BEAM_COEFF_TXT)[0] + ".md5"
+    OUT_BEAM_COEFF_NPZ = os.path.join(OUTPUT_DIR, "beam_coeff.npz")
+    OUT_BEAM_COEFF_BIN = os.path.join(OUTPUT_DIR, "beam_coeff.bin")
+    OUT_BEAM_LAYOUT_PNG = os.path.join(OUTPUT_DIR, "beam32_layout_from_offsets.png")
+
+    return OUTPUT_DIR
+
+
 def resolve_first_solution_time(first_solution_time_utc):
-    """Resolve the requested solution time or fall back to current UTC."""
+    """Resolve an explicitly provided UTC timestamp."""
 
     if first_solution_time_utc is None:
-        return datetime.utcnow().replace(microsecond=0)
-    return datetime.strptime(first_solution_time_utc, "%Y-%m-%d %H:%M:%S")
+        raise ValueError(
+            'A UTC datetime must be provided explicitly to minute precision, for example "2026-06-04 20:20".'
+        )
+    return parse_time_utc_arg(first_solution_time_utc)
 
 
 def get_target_horizontal_coords(target, ant, when_utc):
@@ -586,11 +753,14 @@ def write_text_report(
                     up=enu[2],
                 )
             )
-        lines.append("")
+    lines.append("")
 
     lines.append("Beam coefficient generation:")
+    lines.append("  report_txt             = {}".format(path))
     lines.append("  output_txt             = {}".format(output_paths.beam_coeff_txt))
-    lines.append("  output_npz             = {}".format(output_paths.beam_coeff_npz))
+    lines.append("  output_md5             = {}".format(OUT_BEAM_COEFF_MD5))
+    lines.append("  layout_png             = {}".format(OUT_BEAM_LAYOUT_PNG))
+    lines.append("  other parameter outputs= disabled")
     lines.append("  active_freq_points     = {}".format(runtime_config.n_freq_channels))
     lines.append("  padded_freq_points     = {}".format(beam_phase_data["coeff_cube"].shape[0]))
     lines.append("  active_signal_inputs   = {}".format(beam_phase_data["active_signal_inputs"]))
@@ -599,6 +769,10 @@ def write_text_report(
     lines.append("  coeff_definition       = phi = 2*pi*f*(tau_ref - tau_ant)")
     lines.append("  storage_order          = {}".format(beam_phase_data["order_description"]))
     lines.append("  flattened_stream       = freq0 beam0 signal0..19, beam1 signal0..19, ..., beam31 signal0..19, then freq1, ..., freq2051")
+    lines.append("  txt_layout             = 2052 rows; each row is one frequency channel")
+    lines.append("  txt_values_per_row     = 32 beams * 20 inputs = 640")
+    lines.append("  txt_row_content        = beam0 signal0..19, beam1 signal0..19, ..., beam31 signal0..19")
+    lines.append("  flattened_index        = index = ((freq_index * 32) + beam_index) * 20 + input_index")
     lines.append("")
     lines.append("  Signal labels:")
     for signal_index, label in enumerate(beam_phase_data["signal_labels"]):
@@ -848,7 +1022,6 @@ def build_runtime_config():
 
     return RuntimeConfig(
         ants_txt=ANTS_TXT,
-        first_solution_time_utc=FIRST_SOLUTION_TIME_UTC,
         n_freq_channels=N_FREQ_CHANNELS,
         freq_start_hz=FREQ_START_HZ,
         freq_stop_hz=FREQ_STOP_HZ,
@@ -1100,10 +1273,23 @@ def write_beam_coeff_txt_hardware_order(
     )
     out = prepared["flat_stream"]
 
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.writelines("{:.8e}\n".format(float(value)) for value in out)
+    rows = out.reshape(n_total_freq, n_beams * n_inputs)
+    if rows.shape != (n_total_freq, n_beams * n_inputs):
+        raise ValueError(
+            "Unexpected beam_coeff.txt row shape {}, expected {}".format(
+                rows.shape,
+                (n_total_freq, n_beams * n_inputs),
+            )
+        )
 
-    print("wrote {} float values to {}".format(prepared["value_count"], out_path))
+    with open(out_path, "w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(" ".join("{:.8e}".format(float(value)) for value in row))
+            f.write("\n")
+
+    print("wrote {} frequency rows to {}".format(n_total_freq, out_path))
+    print("values per row: {}".format(n_beams * n_inputs))
+    print("total float values: {}".format(prepared["value_count"]))
     print("order: {}".format(prepared["order_description"]))
     print("active signal inputs: {}".format(prepared["active_signal_inputs"]))
     print("missing signal inputs: {}".format(prepared["missing_signal_inputs"]))
@@ -1297,7 +1483,14 @@ def print_step(title):
         print("=== {} ===".format(title))
 
 
-def print_config_summary(runtime_config, output_paths):
+def print_config_summary(
+    runtime_config,
+    output_paths,
+    target_name,
+    target_ra,
+    target_dec,
+    requested_time_utc,
+):
     """Print the key user-configurable inputs before computation starts."""
 
     if not PRINT_RUNTIME_CONFIG:
@@ -1312,16 +1505,17 @@ def print_config_summary(runtime_config, output_paths):
 
     print_step("Input Configuration")
     print("ants_txt                 : {}".format(runtime_config.ants_txt))
-    print("first_solution_time_utc  : {}".format(runtime_config.first_solution_time_utc))
     print("freq range               : {:.3e} Hz -> {:.3e} Hz".format(
         runtime_config.freq_start_hz,
         runtime_config.freq_stop_hz,
     ))
     print("target input mode        : RA/Dec")
-    print("target name              : {}".format(TARGET_NAME))
-    print("target ra                : {}".format(TARGET_RA))
-    print("target dec               : {}".format(TARGET_DEC))
+    print("target name              : {}".format(target_name))
+    print("target ra                : {}".format(target_ra))
+    print("target dec               : {}".format(target_dec))
+    print("requested time utc       : {}".format(requested_time_utc.strftime("%Y-%m-%d %H:%M:%S")))
     print("visibility check         : ignored")
+    print("output directory         : {}".format(OUTPUT_DIR))
     print("valid freq channels      : {}".format(runtime_config.n_freq_channels))
     print("output coeff freq chans  : {}".format(COEFF_TOTAL_FREQ_CHANNELS))
     print("zero padded freq chans   : {}".format(zero_padded_freq_chans))
@@ -1332,12 +1526,11 @@ def print_config_summary(runtime_config, output_paths):
     print("hardware coeff order     : {}".format(HARDWARE_COEFF_ORDER))
     print("hardware coeff index     : {}".format(HARDWARE_COEFF_INDEX_FORMULA))
     print("hardware coeff count     : {}".format(hardware_coeff_count))
-    print("direction txt            : {}".format(output_paths.direction_txt))
-    print("direction npz            : {}".format(output_paths.direction_npz))
+    print("beam report txt          : {}".format(output_paths.direction_txt))
     print("beam coeff txt           : {}".format(output_paths.beam_coeff_txt))
-    print("beam coeff npz           : {}".format(output_paths.beam_coeff_npz))
-    print("beam coeff bin           : {}".format(OUT_BEAM_COEFF_BIN))
+    print("beam coeff md5           : {}".format(OUT_BEAM_COEFF_MD5))
     print("beam layout png          : {}".format(OUT_BEAM_LAYOUT_PNG))
+    print("other parameter outputs  : disabled")
 
 
 def print_intermediate_samples(results):
@@ -1415,12 +1608,23 @@ def print_intermediate_samples(results):
         print("padded freq channels     : {}".format(info["padded_zero_frequency_channels"]))
 
 
-def run_pipeline_step_by_step():
+def run_pipeline_step_by_step(args):
     """Run the direct-RA/Dec pipeline with each major step written out explicitly."""
 
     runtime_config = build_runtime_config()
     output_paths = build_output_paths()
-    print_config_summary(runtime_config, output_paths)
+    target_ra = args.target_ra
+    target_dec = args.target_dec
+    when_utc = args.when_utc
+    target_name = args.target_name
+    print_config_summary(
+        runtime_config,
+        output_paths,
+        target_name,
+        target_ra,
+        target_dec,
+        when_utc,
+    )
 
     print_step("Step 1: Load Antennas")
     ants, ant_names = load_antennas(
@@ -1431,14 +1635,13 @@ def run_pipeline_step_by_step():
     print("loaded antennas          : {}".format(len(ants)))
 
     print_step("Step 2: Resolve Calculation Time")
-    when_utc = resolve_first_solution_time(runtime_config.first_solution_time_utc)
     print("when_utc                 : {}".format(when_utc.strftime("%Y-%m-%d %H:%M:%S")))
 
     print_step("Step 3: Build Center Target From Input RA/Dec")
     target, target_info = build_target_from_radec(
-        TARGET_NAME,
-        TARGET_RA,
-        TARGET_DEC,
+        target_name,
+        target_ra,
+        target_dec,
     )
     print("target input mode        : {}".format(target_info["input_mode"]))
     print("target name              : {}".format(target_info["target_name"]))
@@ -1505,9 +1708,10 @@ def run_pipeline_step_by_step():
         "beam_phase_data": beam_phase_data,
         "config": {
             "input_mode": "radec",
-            "target_name": TARGET_NAME,
-            "target_ra": TARGET_RA,
-            "target_dec": TARGET_DEC,
+            "target_name": target_name,
+            "target_ra": target_ra,
+            "target_dec": target_dec,
+            "solution_time_utc": when_utc.strftime("%Y-%m-%d %H:%M:%S"),
             "visibility_check": "ignored",
             "beam_offset_convention": BEAM_OFFSET_CONVENTION,
             "hardware_coeff_order": HARDWARE_COEFF_ORDER,
@@ -1535,9 +1739,22 @@ def run_pipeline_step_by_step():
             * runtime_config.total_signal_inputs
         )
 
-        print_step("Step 8: Write Hardware-Order Phi2 Outputs")
+        print_step("Step 8: Write Human-Readable Report")
+        write_text_report(
+            output_paths.direction_txt,
+            when_utc,
+            metrics,
+            antenna_results,
+            beam_phase_data,
+            target_info,
+            output_paths,
+            runtime_config,
+        )
+        results["report_path"] = os.path.abspath(output_paths.direction_txt)
+        print("beam report txt          : {}".format(results["report_path"]))
+
+        print_step("Step 9: Write Hardware-Order Phi2 TXT And MD5")
         print("beam coeff txt order     : {}".format(HARDWARE_COEFF_ORDER))
-        print("beam coeff bin order     : {}".format(HARDWARE_COEFF_ORDER))
         print("beam coeff index formula : {}".format(HARDWARE_COEFF_INDEX_FORMULA))
         print("valid freq channels      : {}".format(frequencies_hz.shape[0]))
         print("output freq channels     : {}".format(COEFF_TOTAL_FREQ_CHANNELS))
@@ -1558,50 +1775,16 @@ def run_pipeline_step_by_step():
             n_active_inputs=beam_phase_data["active_signal_inputs"],
         )
         results["beam_coeff_txt_info"] = beam_coeff_txt_info
-        if WRITE_BEAM_COEFF_BIN:
-            beam_coeff_bin_info = write_beam_coeff_bin_hardware_order(
-                OUT_BEAM_COEFF_BIN,
-                beam_phase_data["coeff_cube"],
-                n_inputs=runtime_config.total_signal_inputs,
-                n_beams=EXPECTED_BEAM_COUNT,
-                n_total_freq=COEFF_TOTAL_FREQ_CHANNELS,
-                n_valid_freq=frequencies_hz.shape[0],
-                n_active_inputs=beam_phase_data["active_signal_inputs"],
-            )
-            results["beam_coeff_bin_info"] = beam_coeff_bin_info
-            results["beam_coeff_bin_path"] = os.path.abspath(OUT_BEAM_COEFF_BIN)
+        beam_coeff_md5 = write_md5_file_for_output(
+            output_paths.beam_coeff_txt,
+            OUT_BEAM_COEFF_MD5,
+        )
+        results["beam_coeff_md5"] = beam_coeff_md5
+        results["beam_coeff_md5_path"] = os.path.abspath(OUT_BEAM_COEFF_MD5)
+        print("beam coeff md5          : {}".format(beam_coeff_md5))
+        print("beam coeff md5 file     : {}".format(OUT_BEAM_COEFF_MD5))
 
-        print_step("Step 9: Write Diagnostic Reports And Plots")
-        print("diagnostic beam coeff npz: {}".format(output_paths.beam_coeff_npz))
-        print("direction text report    : {}".format(output_paths.direction_txt))
-        print("direction npz            : {}".format(output_paths.direction_npz))
-        write_beam_coeff_npz(
-            output_paths.beam_coeff_npz,
-            when_utc,
-            metrics,
-            beam_rows,
-            beam_phase_data,
-            target_info,
-        )
-        write_text_report(
-            output_paths.direction_txt,
-            when_utc,
-            metrics,
-            antenna_results,
-            beam_phase_data,
-            target_info,
-            output_paths,
-            runtime_config,
-        )
-        write_direction_npz(
-            output_paths.direction_npz,
-            when_utc,
-            metrics,
-            beam_rows,
-            antenna_results,
-            beam_phase_data,
-            target_info,
-        )
+        print_step("Step 10: Write Beam Layout Plot")
         if WRITE_LAYOUT_PLOT:
             layout_plot_path = write_beam_layout_plot(
                 OUT_BEAM_LAYOUT_PNG,
@@ -1611,6 +1794,8 @@ def run_pipeline_step_by_step():
             )
             results["layout_plot_path"] = layout_plot_path
             print("beam layout plot         : {}".format(layout_plot_path))
+        else:
+            print("beam layout plot         : disabled")
         print("outputs written")
 
     return results
@@ -1629,6 +1814,12 @@ def print_final_summary(results):
     print("=== Final Summary ===")
     print("Solution time UTC        : {}".format(results["when_utc"].strftime("%Y-%m-%d %H:%M:%S")))
     print(
+        "Input RA/Dec             : {} {}".format(
+            results["target_info"]["input_ra"],
+            results["target_info"]["input_dec"],
+        )
+    )
+    print(
         "Center target RA/Dec     : {} {}".format(
             results["target_info"]["derived_ra"],
             results["target_info"]["derived_dec"],
@@ -1640,6 +1831,8 @@ def print_final_summary(results):
     print("Center beam              : {}".format(CENTER_BEAM_DESCRIPTION))
     print("Beam coeff order         : {}".format(HARDWARE_COEFF_ORDER))
     print("Beam coeff index         : {}".format(HARDWARE_COEFF_INDEX_FORMULA))
+    print("Beam coeff TXT layout    : 2052 rows x 640 values")
+    print("Beam coeff row order     : beam0 input0..19, beam1 input0..19, ..., beam31 input0..19")
     print("Valid freq channels      : {}".format(results["frequencies_hz"].shape[0]))
     print("Output freq channels     : {}".format(results["coeff_total_freq_channels"]))
     print("Total signal inputs      : {}".format(results["runtime_config"].total_signal_inputs))
@@ -1651,6 +1844,9 @@ def print_final_summary(results):
     print("Beam count               : {}".format(len(results["beam_rows"])))
     print("Spacing (deg)            : {:.10f}".format(results["metrics"]["spacing_deg"]))
     print("Coverage radius (deg)    : {:.10f}".format(results["metrics"]["coverage_radius_deg"]))
+    report_path = results.get("report_path")
+    if report_path:
+        print("Beam report TXT          : {}".format(report_path))
     txt_info = results.get("beam_coeff_txt_info")
     if txt_info:
         print("Actual TXT coeff values  : {}".format(txt_info["value_count"]))
@@ -1662,13 +1858,13 @@ def print_final_summary(results):
         print("Missing input fill       : {:.1f}".format(txt_info["missing_input_fill_value"]))
         print("TXT valid freq channels  : {}".format(txt_info["valid_frequency_channels"]))
         print("TXT padded freq channels : {}".format(txt_info["padded_zero_frequency_channels"]))
-    print("Direction TXT report     : {}".format(results["output_paths"].direction_txt))
-    print("Direction NPZ            : {}".format(results["output_paths"].direction_npz))
     print("Beam coeff TXT           : {}".format(results["output_paths"].beam_coeff_txt))
-    print("Beam coeff NPZ           : {}".format(results["output_paths"].beam_coeff_npz))
-    beam_coeff_bin_path = results.get("beam_coeff_bin_path")
-    if beam_coeff_bin_path:
-        print("Beam coeff BIN           : {}".format(beam_coeff_bin_path))
+    beam_coeff_md5_path = results.get("beam_coeff_md5_path")
+    if beam_coeff_md5_path:
+        print("Beam coeff MD5           : {}".format(beam_coeff_md5_path))
+    beam_coeff_md5 = results.get("beam_coeff_md5")
+    if beam_coeff_md5:
+        print("Beam coeff MD5 value     : {}".format(beam_coeff_md5))
     layout_plot_path = results.get("layout_plot_path")
     if layout_plot_path:
         print("Beam layout PNG          : {}".format(layout_plot_path))
@@ -1677,7 +1873,11 @@ def print_final_summary(results):
 def main():
     """Run the direct-RA/Dec beam pipeline and print a short summary."""
 
-    results = run_pipeline_step_by_step()
+    args = parse_args()
+    configure_ants_file(args.ants_file)
+    configure_beam_offsets_file(args.beam_offsets_file)
+    configure_output_dir(args.output_dir)
+    results = run_pipeline_step_by_step(args)
     print_final_summary(results)
 
 

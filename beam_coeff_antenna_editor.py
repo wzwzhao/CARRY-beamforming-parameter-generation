@@ -2,10 +2,11 @@
 # -*- coding: utf-8 -*-
 """Interactive editor for beam_coeff_antenna.txt.
 
-The output format matches the publisher:
+The saved output is plain UTF-8 text so it can be opened directly in a text
+editor:
 - matrix shape: 20 x 32
-- dtype: little-endian float32
-- storage order: C-order row-major
+- values are formatted from float32
+- text layout: one flattened row with 640 space-separated values
 
 Matrix meaning:
 - rows    -> signal input index i
@@ -15,15 +16,28 @@ Matrix meaning:
 
 from __future__ import division, print_function
 
+import argparse
+import hashlib
+import io
 import os
-import tkinter as tk
-from tkinter import messagebox, ttk
 
 import numpy as np
 
+try:
+    import tkinter as tk
+    from tkinter import messagebox, ttk
+    TKINTER_IMPORT_ERROR = None
+except ModuleNotFoundError as exc:
+    tk = None
+    messagebox = None
+    ttk = None
+    TKINTER_IMPORT_ERROR = exc
+
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_OUTPUT_PATH = os.path.join(SCRIPT_DIR, "beam_coeff_antenna.txt")
+DEFAULT_OUTPUT_DIR = SCRIPT_DIR
+DEFAULT_OUTPUT_FILENAME = "beam_coeff_antenna.txt"
+DEFAULT_OUTPUT_PATH = os.path.join(DEFAULT_OUTPUT_DIR, DEFAULT_OUTPUT_FILENAME)
 
 TOTAL_SIGNAL_INPUTS = 20
 TOTAL_BEAMS = 32
@@ -50,6 +64,89 @@ def build_default_matrix():
     return matrix
 
 
+def build_output_path(output_dir, output_filename=DEFAULT_OUTPUT_FILENAME):
+    """Build one output file path from a directory and filename."""
+
+    if output_dir is None:
+        raise ValueError("output_dir must not be None")
+    if not output_filename:
+        raise ValueError("output_filename must not be empty")
+
+    normalized_dir = os.path.abspath(os.path.expanduser(str(output_dir).strip()))
+    if os.path.exists(normalized_dir) and (not os.path.isdir(normalized_dir)):
+        raise ValueError(
+            "Output path exists but is not a directory: {}".format(normalized_dir)
+        )
+    return os.path.join(normalized_dir, output_filename)
+
+
+def parse_args(argv=None):
+    """Parse optional startup settings for the editor."""
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Launch the beam_coeff_antenna editor with a configurable default "
+            "output directory."
+        )
+    )
+    parser.add_argument(
+        "-o",
+        default=DEFAULT_OUTPUT_DIR,
+        help=(
+            "Default directory for beam_coeff_antenna.txt and its .md5 sidecar. "
+            "The GUI output path field is prefilled from this directory."
+        ),
+    )
+    parser.add_argument(
+        "--write-default",
+        action="store_true",
+        help=(
+            "Write the default 20x32 matrix to the output path and exit, "
+            "without launching the Tk GUI."
+        ),
+    )
+    args = parser.parse_args(argv)
+
+    try:
+        args.output_path = build_output_path(args.output_dir)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    return args
+
+
+def ensure_parent_dir(path):
+    """Create the parent directory for one output file path if needed."""
+
+    parent_dir = os.path.dirname(path)
+    if parent_dir and (not os.path.exists(parent_dir)):
+        os.makedirs(parent_dir)
+
+
+def write_default_outputs(path):
+    """Write the default matrix text file and its MD5 sidecar."""
+
+    ensure_parent_dir(path)
+    matrix = build_default_matrix()
+    save_matrix_to_file(path, matrix)
+    md5_path, checksum = write_md5_file_for_output(path)
+    return path, md5_path, checksum
+
+
+def require_tkinter():
+    """Fail with a friendly message when Tkinter is unavailable."""
+
+    if TKINTER_IMPORT_ERROR is None:
+        return
+
+    raise SystemExit(
+        "Tkinter is not available in this Python environment: {}. "
+        "On Ubuntu, install a Tk-enabled Python such as the system package "
+        "`python3-tk`, or run this script with `--write-default` for a "
+        "non-GUI save.".format(TKINTER_IMPORT_ERROR)
+    )
+
+
 def validate_matrix_shape(matrix):
     """Validate the fixed 20x32 matrix shape."""
 
@@ -60,8 +157,62 @@ def validate_matrix_shape(matrix):
     return arr
 
 
-def load_matrix_from_file(path):
-    """Load a little-endian float32 20x32 matrix from disk."""
+def _load_text_matrix(path):
+    """Load a UTF-8 text matrix from disk.
+
+    Supported text layouts:
+    - 1 row x 640 values, matching beam_coeff_antenna_zhao.txt
+    - 20 rows x 32 values, for compatibility with the previous text layout
+    """
+
+    rows = []
+    with io.open(path, "r", encoding="utf-8") as f:
+        for lineno, raw in enumerate(f, 1):
+            line = raw.strip()
+            if not line:
+                continue
+            parts = line.split()
+            rows.append([np.float32(float(token)) for token in parts])
+
+    if len(rows) == 1:
+        flat = np.asarray(rows[0], dtype=np.float32)
+        expected_size = TOTAL_SIGNAL_INPUTS * TOTAL_BEAMS
+        if flat.size != expected_size:
+            raise ValueError(
+                "Expected {} float values in the single text row of {}, got {}".format(
+                    expected_size,
+                    path,
+                    flat.size,
+                )
+            )
+        return flat.reshape((TOTAL_SIGNAL_INPUTS, TOTAL_BEAMS))
+
+    if len(rows) == TOTAL_SIGNAL_INPUTS:
+        for row_index, row in enumerate(rows):
+            if len(row) != TOTAL_BEAMS:
+                raise ValueError(
+                    "Line {} in {} must contain exactly {} float values, got {}".format(
+                        row_index + 1,
+                        path,
+                        TOTAL_BEAMS,
+                        len(row),
+                    )
+                )
+        return np.asarray(rows, dtype=np.float32)
+
+    raise ValueError(
+        "Unsupported text layout in {}: expected either 1 row x {} values or {} rows x {} values, got {} row(s).".format(
+            path,
+            TOTAL_SIGNAL_INPUTS * TOTAL_BEAMS,
+            TOTAL_SIGNAL_INPUTS,
+            TOTAL_BEAMS,
+            len(rows),
+        )
+    )
+
+
+def _load_legacy_binary_matrix(path):
+    """Load the previous little-endian float32 20x32 binary format."""
 
     with open(path, "rb") as f:
         data = np.frombuffer(f.read(), dtype="<f4")
@@ -73,28 +224,80 @@ def load_matrix_from_file(path):
     return data.reshape((TOTAL_SIGNAL_INPUTS, TOTAL_BEAMS)).astype(np.float32)
 
 
+def load_matrix_from_file(path):
+    """Load either the current text format or the previous binary float32 format."""
+
+    try:
+        return _load_text_matrix(path)
+    except UnicodeDecodeError:
+        return _load_legacy_binary_matrix(path)
+    except ValueError as text_exc:
+        try:
+            return _load_legacy_binary_matrix(path)
+        except ValueError:
+            raise text_exc
+
+
 def save_matrix_to_file(path, matrix):
-    """Save a 20x32 matrix using the publisher's binary float32 format."""
+    """Save a 20x32 matrix as one flattened UTF-8 text row."""
 
     matrix = validate_matrix_shape(matrix)
     tmp_path = path + ".tmp"
-    payload = np.asarray(matrix, dtype="<f4")
-    with open(tmp_path, "wb") as f:
-        f.write(payload.tobytes(order="C"))
+    payload = np.asarray(matrix, dtype=np.float32)
+    with io.open(tmp_path, "w", encoding="utf-8") as f:
+        flat = payload.reshape(-1)
+        f.write(" ".join("{:.6f}".format(float(value)) for value in flat))
+        f.write("\n")
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp_path, path)
 
 
+def build_md5_output_path(path):
+    """Replace the source file's final suffix with .md5."""
+
+    root, ext = os.path.splitext(path)
+    if ext:
+        return root + ".md5"
+    return path + ".md5"
+
+
+def compute_file_md5(path, chunk_size=1024 * 1024):
+    """Return the hex MD5 digest for one local file."""
+
+    digest = hashlib.md5()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def write_md5_file_for_output(path):
+    """Write one UTF-8 .md5 sidecar for the requested output file."""
+
+    md5_path = build_md5_output_path(path)
+    checksum = compute_file_md5(path)
+    tmp_path = md5_path + ".tmp"
+    with io.open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
+        f.write("{}  {}\n".format(checksum, os.path.basename(path)))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, md5_path)
+    return md5_path, checksum
+
+
 class BeamCoeffEditor:
     """Tk editor for the 20x32 beam coefficient enable matrix."""
 
-    def __init__(self, root):
+    def __init__(self, root, initial_output_path=DEFAULT_OUTPUT_PATH):
         self.root = root
         self.root.title("beam_coeff_antenna editor")
         self.root.minsize(1280, 760)
 
-        self.output_path_var = tk.StringVar(value=DEFAULT_OUTPUT_PATH)
+        self.output_path_var = tk.StringVar(value=initial_output_path)
         self.status_var = tk.StringVar(value="Ready")
         self.matrix = build_default_matrix()
 
@@ -114,7 +317,7 @@ class BeamCoeffEditor:
         top = ttk.LabelFrame(main, text="File", padding=10)
         top.pack(fill="x")
 
-        ttk.Label(top, text="beam_coeff_antenna.txt").grid(row=0, column=0, sticky="w", padx=(0, 10))
+        ttk.Label(top, text="Output path").grid(row=0, column=0, sticky="w", padx=(0, 10))
         ttk.Entry(top, textvariable=self.output_path_var, width=110).grid(row=0, column=1, sticky="ew")
         ttk.Button(top, text="Load", command=self._load_matrix).grid(row=0, column=2, padx=(10, 0))
         ttk.Button(top, text="Save", command=self._save_matrix).grid(row=0, column=3, padx=(8, 0))
@@ -186,9 +389,9 @@ class BeamCoeffEditor:
             controls,
             text=(
                 "Format reminder:\n"
-                "20 rows = signal inputs i\n"
-                "32 cols = beam indices j\n"
-                "Saved as little-endian float32\n"
+                "20 x 32 matrix in memory\n"
+                "Saved as 1 text row x 640 values\n"
+                "Order: input0 beam0..31, ..., input19 beam0..31\n"
                 "Click any cell on the right to toggle it."
             ),
             justify="left",
@@ -314,17 +517,18 @@ class BeamCoeffEditor:
             messagebox.showwarning("Missing path", "Please enter a file path.")
             return
 
-        parent_dir = os.path.dirname(path)
-        if parent_dir and (not os.path.exists(parent_dir)):
-            os.makedirs(parent_dir)
+        ensure_parent_dir(path)
 
         try:
             save_matrix_to_file(path, self.matrix)
+            md5_path, checksum = write_md5_file_for_output(path)
         except Exception as exc:
             messagebox.showerror("Save failed", str(exc))
             return
 
-        self._update_status("Saved 20x32 float32 matrix to {}".format(path))
+        self._update_status(
+            "Saved txt to {} and md5 to {} ({})".format(path, md5_path, checksum)
+        )
 
     def _handle_canvas_click(self, event):
         row_index = int((event.y - GRID_TOP) // CELL_HEIGHT)
@@ -430,8 +634,18 @@ class BeamCoeffEditor:
 
 
 def main():
+    args = parse_args()
+
+    if args.write_default:
+        path, md5_path, checksum = write_default_outputs(args.output_path)
+        print("Saved default matrix txt : {}".format(path))
+        print("Saved md5 sidecar        : {}".format(md5_path))
+        print("MD5                      : {}".format(checksum))
+        return
+
+    require_tkinter()
     root = tk.Tk()
-    BeamCoeffEditor(root)
+    BeamCoeffEditor(root, initial_output_path=args.output_path)
     root.mainloop()
 
 
