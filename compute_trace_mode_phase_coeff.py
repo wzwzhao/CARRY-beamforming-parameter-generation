@@ -22,27 +22,378 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import ephem
+import katpoint
 import numpy as np
 
-from beam32_from_azel_functions import (
-    build_epoch_time_context,
-    build_katpoint_antennas_from_records,
-    build_katpoint_target_from_radec,
-    compute_source_state,
-    deg_to_dms_str,
-    ensure_utc_datetime,
-    format_dual_timestamp,
-    parse_dec_to_rad,
-    parse_ra_to_rad,
-    signed_angle_delta_rad,
-    trace_build_source_aligned_horizontal_frame as build_source_aligned_horizontal_frame,
-    trace_collect_antenna_beam_results as collect_antenna_beam_results,
-    trace_compute_local_phase_angle_rad as compute_local_phase_angle_rad,
-    wrap_deg_360,
-)
-
-
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def ensure_utc_datetime(when_utc):
+    """Normalize a datetime to timezone-aware UTC."""
+
+    if when_utc is None:
+        return None
+    if when_utc.tzinfo is None:
+        return when_utc.replace(tzinfo=timezone.utc)
+    return when_utc.astimezone(timezone.utc)
+
+
+def format_dual_timestamp(when_utc):
+    """Format one UTC instant in both UTC and local time for terminal output."""
+
+    when_utc = ensure_utc_datetime(when_utc)
+    if when_utc is None:
+        return "None"
+    local_dt = when_utc.astimezone()
+    return "{} UTC | {}".format(
+        when_utc.strftime("%Y-%m-%d %H:%M:%S"),
+        local_dt.strftime("%Y-%m-%d %H:%M:%S %Z"),
+    )
+
+
+def deg_to_dms_str(val):
+    """Convert signed decimal degrees to the D:M:S format used by katpoint."""
+
+    sign = "-" if val < 0 else ""
+    v = abs(val)
+    d = int(v)
+    m_float = (v - d) * 60.0
+    m = int(m_float)
+    s = round((m_float - m) * 60.0, 4)
+    if s >= 60.0:
+        s -= 60.0
+        m += 1
+    if m >= 60:
+        m -= 60
+        d += 1
+    return "{}{}:{:02d}:{:07.4f}".format(sign, d, m, s)
+
+
+def to_katpoint_timestamp(when_utc):
+    """Convert a UTC datetime into the katpoint timestamp format used downstream."""
+
+    when_utc = ensure_utc_datetime(when_utc)
+    return katpoint.Timestamp(when_utc.strftime("%Y-%m-%d %H:%M:%S"))
+
+
+def build_katpoint_antenna_from_record(ant):
+    """Build one katpoint.Antenna from an antenna-like record."""
+
+    desc = "{}, {}, {}, {}, {}".format(
+        ant.name,
+        deg_to_dms_str(ant.lat_deg),
+        deg_to_dms_str(ant.lon_deg),
+        ant.height_m,
+        ant.diameter_m,
+    )
+    return katpoint.Antenna(desc)
+
+
+def build_katpoint_antennas_from_records(antennas):
+    """Build katpoint antenna objects matching parsed antenna records."""
+
+    katpoint_antennas = [build_katpoint_antenna_from_record(ant) for ant in antennas]
+    antenna_names = [ant.name for ant in antennas]
+    return katpoint_antennas, antenna_names
+
+
+def build_katpoint_target_from_radec(target_ra_text, target_dec_text):
+    """Build one frozen katpoint target from RA/Dec text."""
+
+    return katpoint.Target(
+        "Beam32TrackingTarget, radec, {}, {}".format(target_ra_text, target_dec_text)
+    )
+
+
+def normalize(vec):
+    """Return a unit-length copy of the input vector."""
+
+    vec = np.asarray(vec, dtype=np.float64)
+    norm = np.linalg.norm(vec)
+    if (not np.isfinite(norm)) or norm == 0.0:
+        raise ValueError("Cannot normalize vector {}".format(vec))
+    return vec / norm
+
+
+def wrap_az_deg(az_deg):
+    """Wrap azimuth to the [0, 360) degree range."""
+
+    wrapped = float(az_deg) % 360.0
+    if wrapped < 0.0:
+        wrapped += 360.0
+    return wrapped
+
+
+def wrap_deg_360(angle_deg):
+    """Wrap an angle in degrees to [0, 360)."""
+
+    return wrap_az_deg(angle_deg)
+
+
+def wrap_rad_2pi(angle_rad):
+    """Wrap an angle in radians to [0, 2*pi)."""
+
+    return float(angle_rad) % (2.0 * np.pi)
+
+
+def signed_angle_delta_rad(current_rad, previous_rad):
+    """Return the signed shortest-path difference between two angles."""
+
+    delta = float(current_rad) - float(previous_rad)
+    while delta <= -np.pi:
+        delta += 2.0 * np.pi
+    while delta > np.pi:
+        delta -= 2.0 * np.pi
+    return delta
+
+
+def angular_separation_deg(direction_a, direction_b):
+    """Return the angular separation between two ENU direction vectors in degrees."""
+
+    vec_a = normalize(direction_a)
+    vec_b = normalize(direction_b)
+    cosine = float(np.clip(np.dot(vec_a, vec_b), -1.0, 1.0))
+    return float(np.degrees(np.arccos(cosine)))
+
+
+def parse_sexagesimal(text, allow_sign=False):
+    """Parse HH:MM:SS or DD:MM:SS text into signed decimal hours or degrees."""
+
+    raw = str(text).strip()
+    if not raw:
+        raise ValueError("Empty sexagesimal string")
+
+    sign = 1.0
+    if raw[0] in "+-":
+        if not allow_sign:
+            raise ValueError("Unexpected sign in {}".format(text))
+        sign = -1.0 if raw[0] == "-" else 1.0
+        raw = raw[1:].strip()
+
+    parts = raw.split(":")
+    if len(parts) != 3:
+        raise ValueError("Expected HH:MM:SS or DD:MM:SS, got {}".format(text))
+
+    hours_or_deg = float(parts[0])
+    minutes = float(parts[1])
+    seconds = float(parts[2])
+
+    if minutes < 0.0 or minutes >= 60.0:
+        raise ValueError("Minutes out of range in {}".format(text))
+    if seconds < 0.0 or seconds >= 60.0:
+        raise ValueError("Seconds out of range in {}".format(text))
+
+    return sign * (hours_or_deg + minutes / 60.0 + seconds / 3600.0)
+
+
+def parse_ra_to_rad(ra_text):
+    """Parse RA text into radians."""
+
+    return np.deg2rad(parse_sexagesimal(ra_text, allow_sign=False) * 15.0)
+
+
+def parse_dec_to_rad(dec_text):
+    """Parse declination text into radians."""
+
+    return np.deg2rad(parse_sexagesimal(dec_text, allow_sign=True))
+
+
+def rad_to_hms_string(angle_rad):
+    """Format an angle in radians as HH:MM:SS.SS."""
+
+    total_hours = wrap_rad_2pi(angle_rad) * 12.0 / np.pi
+    hours = int(total_hours)
+    minutes_float = (total_hours - hours) * 60.0
+    minutes = int(minutes_float)
+    seconds = (minutes_float - minutes) * 60.0
+    return "{:02d}:{:02d}:{:05.2f}".format(hours, minutes, seconds)
+
+
+def enu_vector_to_altaz_deg(vec_enu):
+    """Convert a local ENU unit vector into altitude and azimuth in degrees."""
+
+    east, north, up = normalize(vec_enu)
+    alt_deg = np.degrees(np.arcsin(np.clip(up, -1.0, 1.0)))
+    az_deg = np.degrees(np.arctan2(east, north))
+    if az_deg < 0.0:
+        az_deg += 360.0
+    return alt_deg, az_deg
+
+
+def get_uvw_basis_enu(target, antenna, when_utc):
+    """Return normalized uvw basis vectors in ENU coordinates for one antenna."""
+
+    basis = np.asarray(
+        target.uvw_basis(timestamp=to_katpoint_timestamp(when_utc), antenna=antenna),
+        dtype=np.float64,
+    )
+    if basis.shape != (3, 3):
+        raise ValueError("Unexpected uvw basis shape {}".format(basis.shape))
+    u_hat = normalize(basis[0])
+    v_hat = normalize(basis[1])
+    w_hat = normalize(basis[2])
+    return u_hat, v_hat, w_hat
+
+
+def build_epoch_time_context(utc_dt):
+    """Build JD and GMST for one logical slot epoch."""
+
+    utc_dt = ensure_utc_datetime(utc_dt)
+    unix_seconds = utc_dt.timestamp()
+    julian_date = unix_seconds / 86400.0 + 2440587.5
+    centuries = (julian_date - 2451545.0) / 36525.0
+    gmst_deg = (
+        280.46061837
+        + 360.98564736629 * (julian_date - 2451545.0)
+        + 0.000387933 * centuries * centuries
+        - (centuries ** 3) / 38710000.0
+    )
+    return {
+        "julian_date": julian_date,
+        "gmst_rad": wrap_rad_2pi(np.deg2rad(gmst_deg)),
+    }
+
+
+def compute_source_state(ref_ant, epoch_time_utc, ra_rad, dec_rad, gmst_rad=None):
+    """Compute hour angle, az/el, and ENU direction for one reference antenna."""
+
+    if gmst_rad is None:
+        gmst_rad = build_epoch_time_context(epoch_time_utc)["gmst_rad"]
+    lst_rad = wrap_rad_2pi(ref_ant.lon_rad + gmst_rad)
+    hour_angle_rad = lst_rad - ra_rad
+    while hour_angle_rad <= -np.pi:
+        hour_angle_rad += 2.0 * np.pi
+    while hour_angle_rad > np.pi:
+        hour_angle_rad -= 2.0 * np.pi
+
+    sin_lat = math.sin(ref_ant.lat_rad)
+    cos_lat = math.cos(ref_ant.lat_rad)
+    sin_dec = math.sin(dec_rad)
+    cos_dec = math.cos(dec_rad)
+    sin_ha = math.sin(hour_angle_rad)
+    cos_ha = math.cos(hour_angle_rad)
+
+    east = -cos_dec * sin_ha
+    north = sin_dec * cos_lat - cos_dec * cos_ha * sin_lat
+    up = sin_dec * sin_lat + cos_dec * cos_ha * cos_lat
+    direction_enu = normalize([east, north, up])
+
+    elevation_rad = math.asin(np.clip(direction_enu[2], -1.0, 1.0))
+    azimuth_rad = wrap_rad_2pi(math.atan2(direction_enu[0], direction_enu[1]))
+
+    return {
+        "epoch_time_utc": ensure_utc_datetime(epoch_time_utc),
+        "lst_rad": lst_rad,
+        "lst_hms": rad_to_hms_string(lst_rad),
+        "hour_angle_rad": hour_angle_rad,
+        "hour_angle_deg": np.rad2deg(hour_angle_rad),
+        "azimuth_rad": azimuth_rad,
+        "elevation_rad": elevation_rad,
+        "azimuth_deg": wrap_deg_360(np.rad2deg(azimuth_rad)),
+        "elevation_deg": np.rad2deg(elevation_rad),
+        "direction_enu": direction_enu,
+    }
+
+
+def offset_direction_vector(u_hat, v_hat, w_hat, d_east_rad, d_north_rad):
+    """Offset Beam 0 by small east/north angular steps and return a new ENU vector."""
+
+    radius_rad = np.hypot(d_east_rad, d_north_rad)
+    if radius_rad == 0.0:
+        return w_hat.copy()
+
+    tangent_offset = d_east_rad * u_hat + d_north_rad * v_hat
+    beam_hat = np.cos(radius_rad) * w_hat + (np.sin(radius_rad) / radius_rad) * tangent_offset
+    return normalize(beam_hat)
+
+
+def trace_compute_beam_vectors_for_antenna(
+    target,
+    antenna,
+    antenna_name,
+    when_utc,
+    beam_offset_rows,
+):
+    """Compute all 32 trace-mode beam ENU vectors and horizontal coordinates for one antenna."""
+
+    beam0_az_rad, beam0_el_rad = target.azel(to_katpoint_timestamp(when_utc), antenna)
+    beam0_az_deg = wrap_az_deg(np.degrees(float(beam0_az_rad)))
+    beam0_el_deg = float(np.degrees(float(beam0_el_rad)))
+    u_hat, v_hat, w_hat = get_uvw_basis_enu(target, antenna, when_utc)
+
+    beam_vectors = []
+    beam_el_deg = []
+    beam_az_deg = []
+    per_beam_rows = []
+
+    for row in beam_offset_rows:
+        beam_hat = offset_direction_vector(u_hat, v_hat, w_hat, row["dEast_rad"], row["dNorth_rad"])
+        el_deg, az_deg = enu_vector_to_altaz_deg(beam_hat)
+        separation_from_beam0_deg = angular_separation_deg(beam_hat, w_hat)
+
+        beam_vectors.append(beam_hat)
+        beam_el_deg.append(el_deg)
+        beam_az_deg.append(az_deg)
+        per_beam_rows.append(
+            {
+                "beam_id": row["beam_id"],
+                "q": row["q"],
+                "r": row["r"],
+                "dEast_deg": row["dEast_deg"],
+                "dNorth_deg": row["dNorth_deg"],
+                "offset_deg": row["offset_deg"],
+                "position_angle_deg": row["position_angle_deg"],
+                "separation_from_beam0_deg": separation_from_beam0_deg,
+                "az_deg": az_deg,
+                "el_deg": el_deg,
+                "enu": beam_hat,
+            }
+        )
+
+    return {
+        "antenna_name": antenna_name,
+        "beam0_az_deg": beam0_az_deg,
+        "beam0_el_deg": beam0_el_deg,
+        "u_hat": u_hat,
+        "v_hat": v_hat,
+        "w_hat": w_hat,
+        "beam_vectors_enu": np.asarray(beam_vectors, dtype=np.float64),
+        "beam_el_deg": np.asarray(beam_el_deg, dtype=np.float64),
+        "beam_el_rad": np.deg2rad(np.asarray(beam_el_deg, dtype=np.float64)),
+        "beam_az_deg": np.asarray(beam_az_deg, dtype=np.float64),
+        "rows": per_beam_rows,
+    }
+
+
+def collect_antenna_beam_results(target, katpoint_antennas, antenna_names, when_utc, beam_offset_rows):
+    """Run the per-antenna 32-beam direction-vector calculation for all antennas."""
+
+    return [
+        trace_compute_beam_vectors_for_antenna(target, antenna, antenna_name, when_utc, beam_offset_rows)
+        for antenna, antenna_name in zip(katpoint_antennas, antenna_names)
+    ]
+
+
+def build_source_aligned_horizontal_frame(beam_direction_enu, angle_eps=1.0e-12):
+    """Build the x/y/z basis used by the trace-mode A/B/omega model."""
+
+    z_hat = np.asarray([0.0, 0.0, 1.0], dtype=np.float64)
+    horizontal = np.asarray([beam_direction_enu[0], beam_direction_enu[1], 0.0], dtype=np.float64)
+    if np.linalg.norm(horizontal) < angle_eps:
+        x_hat = np.asarray([1.0, 0.0, 0.0], dtype=np.float64)
+        y_hat = np.asarray([0.0, 1.0, 0.0], dtype=np.float64)
+    else:
+        x_hat = normalize(horizontal)
+        y_hat = normalize(np.asarray([-x_hat[1], x_hat[0], 0.0], dtype=np.float64))
+    return x_hat, y_hat, z_hat
+
+
+def compute_local_phase_angle_rad(direction_enu, x_hat, y_hat):
+    """Compute delta-phi in the local beam model around one slot epoch."""
+
+    x_comp = float(np.dot(direction_enu, x_hat))
+    y_comp = float(np.dot(direction_enu, y_hat))
+    return math.atan2(y_comp, x_comp)
 
 
 # =========================
