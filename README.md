@@ -441,7 +441,7 @@ GUI 默认不负责长期阻塞运行的连续发布。
   - 这是另一条辅助流程，不是当前 trace 发布主链路
 
 - `beam_coeff_antenna_editor.py`
-  - 用 GUI 编辑 `20 x 32` 的 beam enable 矩阵
+  - 用 GUI 或命令行编辑 `20 x 32` 的 beam enable 矩阵
 
 - `compute_beam_coeff_external_tmp.py`
   - 一个相对独立的波束系数/方向向量计算脚本
@@ -503,6 +503,33 @@ BeamID q r dEast_deg dNorth_deg
 - `beam_index = 0..31`
 
 
+### 8.3 `beam_coeff_antenna.txt`
+
+这是 `beam_coeff_antenna_editor.py` 生成或编辑的波束使能矩阵文件。
+
+逻辑含义：
+
+- 矩阵大小固定为 `20 x 32`
+- 行索引 `i` 表示信号输入路
+- 列索引 `j` 表示波束编号
+- `M[i, j] = 0` 表示该输入路在该波束位置关闭
+- `M[i, j] = 1` 表示该输入路在该波束位置开启
+
+文件落盘格式：
+
+- 文件名：`beam_coeff_antenna.txt`
+- 文本格式：UTF-8
+- 存储方式：单行、空格分隔
+- 总值数量：`20 * 32 = 640`
+- 展平顺序：`input0 beam0..31, ..., input19 beam0..31`
+
+也就是说，这个文件虽然逻辑上是二维矩阵，但磁盘上的实际格式是：
+
+```text
+v00 v01 ... v031 v10 v11 ... v1931
+```
+
+
 ## 9. 运行方式
 
 ### 9.1 运行连续发布主程序
@@ -557,6 +584,60 @@ python compute_beamforming_reference_delay_from_txt.py
 - 电缆相对延迟
 - 时间延迟量化
 - `time_phase_coeff.dat / .npz`
+
+
+### 9.4 编辑 `beam_coeff_antenna.txt`
+
+打开 GUI 编辑器：
+
+```bash
+python beam_coeff_antenna_editor.py -o D:\output_dir
+```
+
+只输出默认矩阵，不打开 GUI：
+
+```bash
+python beam_coeff_antenna_editor.py --write-default -o D:\output_dir
+```
+
+用命令行直接修改，不打开 GUI：
+
+```bash
+python beam_coeff_antenna_editor.py --set-all 0 --set "0:3=1" -o D:\output_dir
+```
+
+这条命令表示：
+
+- 先把全部 `20 x 32` 单元置为 `0`
+- 再把第 `0` 路输入的第 `3` 个波束位置置为 `1`
+
+更常见的批量写法例如：
+
+```bash
+python beam_coeff_antenna_editor.py --set "0-7:all=1" --set "8-19:all=0" -o D:\output_dir
+```
+
+表示前 `0..7` 路对全部 `32` 个波束开启，后 `8..19` 路全部关闭。
+
+如果希望先加载已有文件、再局部修改：
+
+```bash
+python beam_coeff_antenna_editor.py -i D:\old\beam_coeff_antenna.txt --set "19:31=1" -o D:\output_dir
+```
+
+其中：
+
+- `-o / --output-dir`：指定输出目录
+- `-i / --input-file`：先读取已有 `beam_coeff_antenna.txt`
+- `--set-all VALUE`：先把全部单元置为同一个值
+- `--set "SIGNALS:BEAMS=VALUE"`：按区域设置
+
+`SIGNALS` 和 `BEAMS` 支持以下写法：
+
+- 单个编号，例如 `3`
+- 范围，例如 `0-7`
+- 列表，例如 `0,2,5`
+- `all`
 
 
 ## 10. 依赖环境

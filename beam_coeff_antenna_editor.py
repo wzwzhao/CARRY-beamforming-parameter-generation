@@ -86,11 +86,13 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description=(
             "Launch the beam_coeff_antenna editor with a configurable default "
-            "output directory."
+            "output directory, or edit the matrix from the command line."
         )
     )
     parser.add_argument(
         "-o",
+        "--output-dir",
+        dest="output_dir",
         default=DEFAULT_OUTPUT_DIR,
         help=(
             "Default directory for beam_coeff_antenna.txt and its .md5 sidecar. "
@@ -105,7 +107,41 @@ def parse_args(argv=None):
             "without launching the Tk GUI."
         ),
     )
+    parser.add_argument(
+        "-i",
+        "--input-file",
+        dest="input_path",
+        help=(
+            "Optional existing beam_coeff_antenna file to load before applying "
+            "command-line edits. If omitted, command-line edits start from the "
+            "built-in default matrix."
+        ),
+    )
+    parser.add_argument(
+        "--set-all",
+        dest="set_all_value",
+        type=float,
+        help=(
+            "In non-GUI mode, set all 20x32 cells to one float value before "
+            "applying any --set expressions."
+        ),
+    )
+    parser.add_argument(
+        "--set",
+        dest="set_expressions",
+        action="append",
+        default=[],
+        metavar="SIGNALS:BEAMS=VALUE",
+        help=(
+            "In non-GUI mode, set one signal/beam region. Example: "
+            "\"0:3=1\", \"0-7:all=1\", \"8-19:0-31=0\". Repeat --set for "
+            "multiple edits."
+        ),
+    )
     args = parser.parse_args(argv)
+
+    if args.write_default and (args.input_path or (args.set_all_value is not None) or args.set_expressions):
+        parser.error("--write-default cannot be combined with --input-file, --set-all, or --set")
 
     try:
         args.output_path = build_output_path(args.output_dir)
@@ -133,6 +169,158 @@ def write_default_outputs(path):
     return path, md5_path, checksum
 
 
+def parse_index_spec(spec_text, upper_bound, axis_name):
+    """Parse one index spec such as 0, 0-7, 0,2,5, or all."""
+
+    raw = str(spec_text).strip().lower()
+    if not raw:
+        raise ValueError("Empty {} index spec".format(axis_name))
+    if raw in ("all", "*"):
+        return list(range(upper_bound))
+
+    indices = []
+    seen = set()
+    for part in raw.split(","):
+        token = part.strip().lower()
+        if not token:
+            raise ValueError("Empty {} index token in {!r}".format(axis_name, spec_text))
+
+        if token in ("all", "*"):
+            values = range(upper_bound)
+        elif "-" in token:
+            range_parts = token.split("-", 1)
+            if len(range_parts) != 2 or (not range_parts[0]) or (not range_parts[1]):
+                raise ValueError(
+                    "Invalid {} range {!r}; expected start-end".format(axis_name, token)
+                )
+            start = int(range_parts[0])
+            stop = int(range_parts[1])
+            if stop < start:
+                raise ValueError(
+                    "Invalid {} range {!r}; stop must be >= start".format(axis_name, token)
+                )
+            values = range(start, stop + 1)
+        else:
+            values = [int(token)]
+
+        for value in values:
+            if value < 0 or value >= upper_bound:
+                raise ValueError(
+                    "{} index {} out of range [0, {}]".format(
+                        axis_name,
+                        value,
+                        upper_bound - 1,
+                    )
+                )
+            if value not in seen:
+                indices.append(value)
+                seen.add(value)
+
+    return indices
+
+
+def parse_set_expression(expr_text):
+    """Parse one command-line matrix edit expression."""
+
+    raw = str(expr_text).strip()
+    if "=" not in raw:
+        raise ValueError(
+            "Invalid --set expression {!r}; expected SIGNALS:BEAMS=VALUE".format(raw)
+        )
+
+    region_text, value_text = raw.rsplit("=", 1)
+    if ":" not in region_text:
+        raise ValueError(
+            "Invalid --set expression {!r}; expected SIGNALS:BEAMS=VALUE".format(raw)
+        )
+
+    signal_text, beam_text = region_text.split(":", 1)
+    signal_indices = parse_index_spec(signal_text, TOTAL_SIGNAL_INPUTS, "signal")
+    beam_indices = parse_index_spec(beam_text, TOTAL_BEAMS, "beam")
+
+    try:
+        value = np.float32(float(value_text.strip()))
+    except ValueError:
+        raise ValueError(
+            "Invalid value {!r} in --set expression {!r}".format(value_text.strip(), raw)
+        )
+
+    return {
+        "raw": raw,
+        "signal_indices": signal_indices,
+        "beam_indices": beam_indices,
+        "value": value,
+    }
+
+
+def should_run_cli_mode(args):
+    """Return whether the request should execute in non-GUI mode."""
+
+    return bool(
+        args.write_default
+        or args.input_path
+        or (args.set_all_value is not None)
+        or args.set_expressions
+    )
+
+
+def build_matrix_from_cli_args(args):
+    """Build one matrix from command-line options without launching the GUI."""
+
+    if args.input_path:
+        input_path = os.path.abspath(os.path.expanduser(args.input_path))
+        if not os.path.exists(input_path):
+            raise ValueError("Input file does not exist: {}".format(input_path))
+        matrix = load_matrix_from_file(input_path)
+        source_label = input_path
+    else:
+        matrix = build_default_matrix()
+        source_label = "built-in default"
+
+    matrix = np.asarray(matrix, dtype=np.float32).copy()
+    operation_summaries = []
+
+    if args.set_all_value is not None:
+        fill_value = np.float32(args.set_all_value)
+        matrix[:, :] = fill_value
+        operation_summaries.append(
+            "Set all {} cell(s) to {}".format(
+                TOTAL_SIGNAL_INPUTS * TOTAL_BEAMS,
+                "{:.6f}".format(float(fill_value)),
+            )
+        )
+
+    for expr_text in args.set_expressions:
+        op = parse_set_expression(expr_text)
+        matrix[np.ix_(op["signal_indices"], op["beam_indices"])] = op["value"]
+        operation_summaries.append(
+            "Applied {!r} to {} cell(s)".format(
+                op["raw"],
+                len(op["signal_indices"]) * len(op["beam_indices"]),
+            )
+        )
+
+    return validate_matrix_shape(matrix), source_label, operation_summaries
+
+
+def write_cli_outputs(args):
+    """Apply command-line edits and save the resulting matrix."""
+
+    matrix, source_label, operation_summaries = build_matrix_from_cli_args(args)
+    ensure_parent_dir(args.output_path)
+    save_matrix_to_file(args.output_path, matrix)
+    md5_path, checksum = write_md5_file_for_output(args.output_path)
+    ones_count = int(np.count_nonzero(matrix > 0.5))
+
+    print("Matrix source            : {}".format(source_label))
+    for summary in operation_summaries:
+        print(summary)
+    print("Active cells             : {} / {}".format(ones_count, TOTAL_SIGNAL_INPUTS * TOTAL_BEAMS))
+    print("Saved matrix txt         : {}".format(args.output_path))
+    print("Saved md5 sidecar        : {}".format(md5_path))
+    print("MD5                      : {}".format(checksum))
+
+
 def require_tkinter():
     """Fail with a friendly message when Tkinter is unavailable."""
 
@@ -142,8 +330,8 @@ def require_tkinter():
     raise SystemExit(
         "Tkinter is not available in this Python environment: {}. "
         "On Ubuntu, install a Tk-enabled Python such as the system package "
-        "`python3-tk`, or run this script with `--write-default` for a "
-        "non-GUI save.".format(TKINTER_IMPORT_ERROR)
+        "`python3-tk`, or run this script with `--write-default` or `--set` "
+        "for a non-GUI save.".format(TKINTER_IMPORT_ERROR)
     )
 
 
@@ -158,7 +346,7 @@ def validate_matrix_shape(matrix):
 
 
 def _load_text_matrix(path):
-    """Load a UTF-8 text matrix from disk.
+    """Load one legacy UTF-8 text matrix from disk.
 
     Supported text layouts:
     - 1 row x 640 values, matching beam_coeff_antenna_zhao.txt
@@ -211,8 +399,8 @@ def _load_text_matrix(path):
     )
 
 
-def _load_legacy_binary_matrix(path):
-    """Load the previous little-endian float32 20x32 binary format."""
+def _load_binary_matrix(path):
+    """Load one little-endian float32 20x32 binary matrix from disk."""
 
     with open(path, "rb") as f:
         data = np.frombuffer(f.read(), dtype="<f4")
@@ -224,16 +412,34 @@ def _load_legacy_binary_matrix(path):
     return data.reshape((TOTAL_SIGNAL_INPUTS, TOTAL_BEAMS)).astype(np.float32)
 
 
+def _looks_like_binary_matrix_file(path):
+    """Heuristically detect the fixed-size binary float32 output format."""
+
+    expected_bytes = TOTAL_SIGNAL_INPUTS * TOTAL_BEAMS * np.dtype("<f4").itemsize
+    if os.path.getsize(path) != expected_bytes:
+        return False
+
+    with open(path, "rb") as f:
+        sample = f.read(min(256, expected_bytes))
+    return b"\x00" in sample
+
+
 def load_matrix_from_file(path):
-    """Load either the current text format or the previous binary float32 format."""
+    """Load either the current text format or one legacy binary format."""
+
+    if _looks_like_binary_matrix_file(path):
+        try:
+            return _load_binary_matrix(path)
+        except ValueError:
+            pass
 
     try:
         return _load_text_matrix(path)
     except UnicodeDecodeError:
-        return _load_legacy_binary_matrix(path)
+        return _load_binary_matrix(path)
     except ValueError as text_exc:
         try:
-            return _load_legacy_binary_matrix(path)
+            return _load_binary_matrix(path)
         except ValueError:
             raise text_exc
 
@@ -641,6 +847,10 @@ def main():
         print("Saved default matrix txt : {}".format(path))
         print("Saved md5 sidecar        : {}".format(md5_path))
         print("MD5                      : {}".format(checksum))
+        return
+
+    if should_run_cli_mode(args):
+        write_cli_outputs(args)
         return
 
     require_tkinter()
